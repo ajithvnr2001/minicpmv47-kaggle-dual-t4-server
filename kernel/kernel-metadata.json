@@ -1,0 +1,17 @@
+{
+  "id": "ajithkumaevnr2001/minicpmv47-server-dual-t4",
+  "id_no": null,
+  "title": "minicpmv47-server-dual-t4",
+  "code_file": "serve-minicpmv47-t4x2.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}

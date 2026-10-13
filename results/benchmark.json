@@ -1,0 +1,24 @@
+{
+  "measured_on": "2026-10-13",
+  "hardware": "Kaggle GPU T4 x2 (2 x Tesla T4, 15360 MiB each), driver 580.178.04, CUDA 13.0",
+  "model": "AtomicChat/MiniCPM-V-4.7-35B-A3B-Abliterated-Uncensored-GGUF (AD-Q4_K-IQ4_XS, ~20 GB, 11 parts)",
+  "runtime": "llama.cpp b11583 (CUDA 12.8 prebuilt + cudart runtime libs)",
+  "server_flags": "-c 32768 -t 4 --host 0.0.0.0 --port 8080 -ngl 999 -sm layer -ts 1,1 -ctk q8_0 -ctv q8_0 --mmproj ...-F16.gguf",
+  "phases_ok": true,
+  "timing": {
+    "prompt_prefill_tokens_per_s": 111.77,
+    "decode_tokens_per_s": 57.47,
+    "api_text_tokens_per_s": [51.35, 54.66],
+    "api_vision_tokens_per_s": 30.96,
+    "model_load_sec": 85.1,
+    "model_download_sec": 90.6,
+    "first_request_warmup_sec": 45.5
+  },
+  "per_gpu_memory_mib": {"GPU0_used": 11421, "GPU1_used": 9831, "per_gpu_total": 15360},
+  "notes": [
+    "Both T4s are loaded simultaneously: 11.4 GB + 9.8 GB = 21.3 GB model + KV across the pipeline-parallel split.",
+    "CPU-only (no -ngl) on the same box: ~5 tokens/s decode -> dual-GPU split is ~10x.",
+    "llama-bench does NOT honour multi-GPU layer splits at b11583; numbers above are from the server's own slot print_timing + API wall-clock.",
+    "MiniCPM-V 4.7 is a thinking model: answers may arrive in reasoning_content."
+  ]
+}
