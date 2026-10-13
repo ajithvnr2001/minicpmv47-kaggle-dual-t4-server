@@ -160,7 +160,7 @@ Environment knobs (set before pushing, they're read at run time):
 | Var | Default | Meaning |
 |---|---|---|
 | `MODE` | `server` | `server` = serve + tunnel + keepalive; `test` = benchmark once and exit |
-| `CTX` | `32768` | context length (tokens). 32K KV ≈ 1.3 GB; up to 256K is model-native |
+| `CTX` | `262144` | context length (tokens) — the model's native max. Auto-halves (128K→64K→32K) if the KV cache won't fit in VRAM at load time |
 | `PORT` | `8080` | server port (the tunnel targets it) |
 | `NTFY_TOPIC` | `ajith-kaggle-minicpmv47-cluster` | topic the public URL is published to |
 | `NTFY_CONTROL` | `ajith-kaggle-minicpmv47-control` | topic that accepts the `shutdown` control word |
@@ -205,8 +205,11 @@ so the dual-GPU split is worth roughly **10×**.
 
 **Context length.** The model is natively trained to 262,144 tokens (interleaved
 linear/full attention makes KV tiny — only the 10 full-attention layers cache).
-32K is a safe daily driver; 65–128K fits comfortably in dual-T4 VRAM. Beyond that,
-**prefill time** (not memory) becomes the limit — minutes per long prompt. Set with `CTX=65536`.
+32K is a safe daily driver; **256K (the model's native max) has been verified running
+on dual T4** — 21 GB of model + ~5 GB q8-KV fit the 30 GB combined VRAM. Beyond
+memory, **prefill time** becomes the limit: a full 256K prompt takes minutes to
+prefill, while decode stays ~50 tok/s. The script auto-halves the context
+(128K→64K→32K) if the KV cache won't fit at load time. Set with `CTX=...`.
 
 **Quantization.** Quants in the source repo:
 

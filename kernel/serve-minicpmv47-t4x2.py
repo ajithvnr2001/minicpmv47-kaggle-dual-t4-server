@@ -24,8 +24,13 @@ LL_DIR    = "/tmp/llama_bin"
 CF_BIN    = "/tmp/cloudflared"
 WORK_DIR  = "/kaggle/working"
 PORT      = int(os.environ.get("PORT", "8080"))
-CTX       = int(os.environ.get("CTX", "32768"))
+# NOTE: on Kaggle, env vars are NOT passed into kernel runs, so this default is
+# what actually takes effect - edit it here and re-push to change context.
+# 262144 = the model's native max (256K). If that won't fit in VRAM at load
+# time, start_server() below automatically halves it (128K -> 64K -> 32K).
+CTX       = int(os.environ.get("CTX", "262144"))
 results   = {"mode": MODE, "phases": {}, "started": UTC()}
+ACTUAL_CTX = [CTX]   # updated by start_server() if it had to shrink
 
 def run(cmd, timeout=None, stdin_devnull=False):
     print("$ " + (" ".join(cmd) if isinstance(cmd, list) else cmd), flush=True)
@@ -164,37 +169,46 @@ def start_server():
         return None
     base = [bins["llama-server"], "-m", os.path.join(MM_DIR, LM_PART1),
             "--mmproj", MMPROJ_FILE,
-            "-c", str(CTX), "-t", "4",
-            "--host", "0.0.0.0", "--port", str(PORT)]
-    attempts = [
-        base + split_flags(n_gpu) + ["-ctk", "q8_0", "-ctv", "q8_0"],
-        base + split_flags(n_gpu) + ["-ctk", "f16", "-ctv", "f16"],
-        base + split_flags(n_gpu),
-    ]
-    for i, cmd in enumerate(attempts):
-        print(f"\n[server start attempt {i+1}/{len(attempts)}]\n$ {' '.join(cmd[1:])}", flush=True)
-        subprocess.run(["bash", "-lc", "pkill -f llama-server || true"], timeout=30)
-        lf = open("/tmp/server.log", "w")
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                                preexec_fn=os.setsid)
-        t0, healthy = time.time(), False
-        while time.time() - t0 < 900:
-            if proc.poll() is not None:
-                break
-            try:
-                if requests.get(SERVER_BASE + "/health", timeout=5).status_code == 200:
-                    healthy = True
+            "-t", "4", "--host", "0.0.0.0", "--port", str(PORT)]
+    # Try the requested context; if it will not fit in VRAM, halve and retry.
+    # (OOM happens at LOAD time, never mid-chat - KV is pre-allocated.)
+    ctx = CTX
+    while ctx >= 32768:
+        attempts = [
+            base + ["-c", str(ctx)] + split_flags(n_gpu) + ["-ctk", "q8_0", "-ctv", "q8_0"],
+            base + ["-c", str(ctx)] + split_flags(n_gpu) + ["-ctk", "f16", "-ctv", "f16"],
+            base + ["-c", str(ctx)] + split_flags(n_gpu),
+        ]
+        for i, cmd in enumerate(attempts):
+            print(f"\n[server start attempt ctx={ctx} {i+1}/{len(attempts)}]\n$ {' '.join(cmd[1:])}", flush=True)
+            subprocess.run(["bash", "-lc", "pkill -f llama-server || true"], timeout=30)
+            lf = open("/tmp/server.log", "w")
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                    preexec_fn=os.setsid)
+            t0, healthy = time.time(), False
+            while time.time() - t0 < 900:
+                if proc.poll() is not None:
                     break
-            except Exception:
-                pass
-            time.sleep(5)
-        lf.close()
-        print(f"[server] healthy={healthy} after {round(time.time()-t0,1)}s", flush=True)
-        if healthy:
-            results["server_cmd"] = " ".join(cmd[1:])
-            results["server_load_sec"] = round(time.time() - t0, 1)
-            return proc
-        print("[server start failed] log tail:\n" + open("/tmp/server.log").read()[-2500:], flush=True)
+                try:
+                    if requests.get(SERVER_BASE + "/health", timeout=5).status_code == 200:
+                        healthy = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(5)
+            lf.close()
+            print(f"[server] ctx={ctx} healthy={healthy} after {round(time.time()-t0,1)}s", flush=True)
+            if healthy:
+                results["server_cmd"] = " ".join(cmd[1:])
+                results["server_load_sec"] = round(time.time() - t0, 1)
+                results["actual_context"] = ctx
+                ACTUAL_CTX[0] = ctx
+                if ctx != CTX:
+                    print(f"[!] requested CTX={CTX} did not fit; running with ctx={ctx}", flush=True)
+                return proc
+            print("[server start failed] log tail:\n" + open("/tmp/server.log").read()[-2500:], flush=True)
+        ctx //= 2
+        print(f"[server] retrying with smaller context: {ctx}", flush=True)
     return None
 
 # ------------------------------------------------------- cloudflare tunnel
@@ -259,7 +273,8 @@ def announce(url):
         "endpoints_in_session": {"chat": SERVER_BASE + "/v1/chat/completions"},
         "gpus": results.get("env", {}).get("gpu_list"),
         "gpu_memory_after_load": results.get("gpu_mem_after_load"),
-        "context": CTX, "kv_cache": "q8_0",
+        "context": ACTUAL_CTX[0],
+        "kv_cache": "q8_0",
         "server_cmd": results.get("server_cmd"),
         "note": ("OpenAI-compatible: use <public_base_url>/v1 as base_url in any "
                  "OpenAI SDK / Open WebUI / LobeChat. Built-in llama.cpp WebUI at "
