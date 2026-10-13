@@ -1,26 +1,30 @@
 # =====================================================================
 #  MiniCPM-V-4.7-35B-A3B-Abliterated-Uncensored-GGUF
-#  Long-running dual-GPU (Kaggle T4 x2) llama.cpp server
+#  Long-running dual-GPU (Kaggle T4 x2) llama.cpp server + Cloudflare tunnel
 #
-#  MODES (env var MODE):
+#  MODES (env MODE):
 #    server (default) - install, download, start llama-server on BOTH T4s,
-#                       self-test, then keep the server alive until Kaggle
-#                       ends the session (12h max).
+#                       self-test, expose it via a Cloudflare quick tunnel,
+#                       publish the URL to ntfy.sh, and stay alive until Kaggle
+#                       ends the session (12h cap). A control topic allows
+#                       remote shutdown to save GPU quota.
 #    test            - install, download, benchmark + functional tests, exit.
 #
-#  NO SECRETS: the HF repo is public, so no tokens are needed.
-#  Everything is downloaded to /tmp (scratch; not persisted between sessions).
+#  NO SECRETS: the HF repo is public. Nothing secret is written to log/ntfy.
 # =====================================================================
-import os, re, sys, time, json, glob, subprocess, signal
+import os, re, sys, time, json, glob, subprocess, threading
 from datetime import datetime, timezone
 
 MODE      = os.environ.get("MODE", "server").lower()   # server | test
+NTFY_TOPIC   = os.environ.get("NTFY_TOPIC",   "ajith-kaggle-minicpmv47-cluster")
+NTFY_CONTROL = os.environ.get("NTFY_CONTROL", "ajith-kaggle-minicpmv47-control")
 UTC       = lambda: datetime.now(timezone.utc).isoformat()
 MM_DIR    = "/tmp/mm"
 LL_DIR    = "/tmp/llama_bin"
+CF_BIN    = "/tmp/cloudflared"
 WORK_DIR  = "/kaggle/working"
 PORT      = int(os.environ.get("PORT", "8080"))
-CTX       = int(os.environ.get("CTX", "32768"))        # context length
+CTX       = int(os.environ.get("CTX", "32768"))
 results   = {"mode": MODE, "phases": {}, "started": UTC()}
 
 def run(cmd, timeout=None, stdin_devnull=False):
@@ -61,12 +65,11 @@ def phase_a():
 n_gpu = phase("A_recon", phase_a) or 0
 
 # ------------------------------------------------- B. llama.cpp (prebuilt)
-# Two tarballs: the binaries + the CUDA runtime libs. They must live in the
-# SAME directory because the binaries use RUNPATH=$ORIGIN.
-# DO NOT set LD_LIBRARY_PATH to that dir: the cudart package ships an NVML
-# stub that shadows the driver's libnvidia-ml.so (-> CPU fallback + dead
-# nvidia-smi).  This cost a whole debugging cycle; don't repeat it.
-REPO_ID   = "b11583"
+# Two tarballs: binaries + CUDA runtime libs, merged into ONE directory because
+# the binaries use RUNPATH=$ORIGIN. DO NOT set LD_LIBRARY_PATH to that dir:
+# the cudart package ships an NVML stub that shadows the driver's
+# libnvidia-ml.so -> silent CPU fallback (5 tok/s) and dead nvidia-smi.
+REPO_ID   = os.environ.get("LLAMA_BUILD", "b11583")
 MAIN_TARBALL = (f"https://github.com/ggml-org/llama.cpp/releases/download/{REPO_ID}/"
                 f"llama-{REPO_ID}-bin-ubuntu-cuda-12.8-x64.tar.gz")
 CUDA_TARBALL = (f"https://github.com/ggml-org/llama.cpp/releases/download/{REPO_ID}/"
@@ -100,7 +103,23 @@ def phase_b():
     bins = {n: os.path.join(lm_dir, n) for n in ("llama-server", "llama-cli")
             if os.path.exists(os.path.join(lm_dir, n))}
     print(f"[binaries] {bins}", flush=True)
+    results["llama_build"] = REPO_ID
     return bins
+
+def phase_b_cloudflared():
+    r = run(["bash", "-lc",
+             f"curl -fL --retry 3 -o {CF_BIN} "
+             "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+             f"cloudflared-linux-amd64 && chmod +x {CF_BIN} && {CF_BIN} --version"], timeout=600)
+    print((r.stdout or "")[:200], (r.stderr or "")[-300:], flush=True)
+    if not os.path.exists(CF_BIN) or r.returncode != 0:
+        raise RuntimeError("cloudflared install failed")
+    os.chmod(CF_BIN, 0o755)          # belt & braces (the earlier f-string bug bit here)
+    print("[+] cloudflared installed", flush=True)
+    return True
+
+if MODE == "server":
+    phase("B2_cloudflared", phase_b_cloudflared)
 
 bins = phase("B_llamacpp", phase_b) or {}
 
@@ -132,16 +151,13 @@ MMPROJ_FILE = next((os.path.join(MM_DIR, f) for f in model_files
 
 # ------------------------------------------------------------- split helper
 def split_flags(n):
-    # Pipeline-parallel layer split across all visible T4s (no NVLink; fine).
     if n >= 2:
         return ["-ngl", "999", "-sm", "layer", "-ts", ",".join(["1"] * n)]
-    # Single-GPU fallback: keep some MoE expert tensors on CPU, auto-fit the rest.
     return ["-ngl", "999", "-sm", "layer", "--cpu-moe", "--n-cpu-moe", "24"]
 
-SERVER_BASE = (f"http://127.0.0.1:{PORT}")
+SERVER_BASE = f"http://127.0.0.1:{PORT}"
 
 def start_server():
-    """Start llama-server, retrying with safer flags. Returns Popen or None."""
     import requests
     if not bins.get("llama-server") or not LM_PART1:
         print("[server] binaries or model missing", flush=True)
@@ -181,6 +197,86 @@ def start_server():
         print("[server start failed] log tail:\n" + open("/tmp/server.log").read()[-2500:], flush=True)
     return None
 
+# ------------------------------------------------------- cloudflare tunnel
+URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+def start_tunnel():
+    """Start cloudflared quick tunnel; return (proc, url|None). Never raises."""
+    try:
+        if not os.path.exists(CF_BIN):
+            print("[tunnel] cloudflared missing", flush=True)
+            return None, None
+        os.chmod(CF_BIN, 0o755)
+        subprocess.run(["bash", "-lc", "pkill -f cloudflared || true"], timeout=30)
+        tf = open("/tmp/tunnel.log", "w")
+        proc = subprocess.Popen([CF_BIN, "tunnel", "--url", f"http://127.0.0.1:{PORT}"],
+                                stdout=tf, stderr=subprocess.STDOUT,
+                                preexec_fn=os.setsid)
+    except Exception as e:
+        print(f"[tunnel] start failed: {e}", flush=True)
+        return None, None
+    url, t0 = None, time.time()
+    while time.time() - t0 < 120:
+        if proc.poll() is not None:
+            break
+        try:
+            m = URL_RE.search(open("/tmp/tunnel.log").read())
+        except Exception:
+            m = None
+        if m:
+            url = m.group(0)
+            break
+        time.sleep(2)
+    tf.close()
+    print(f"[tunnel] url={url} (elapsed {round(time.time()-t0,1)}s)", flush=True)
+    if url is None:
+        print("[tunnel] log tail:\n" + open("/tmp/tunnel.log").read()[-1500:], flush=True)
+    return proc, url
+
+def announce(url):
+    """Publish the public endpoint: ntfy topic + files + log banner."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=url.encode("utf-8"),
+            headers={"Title": "MiniCPM-V 4.7 Kaggle dual-T4 server live",
+                     "Priority": "high", "Tags": "zap,gpu"})
+        urllib.request.urlopen(req, timeout=10)
+        print(f"[+] URL published to ntfy.sh/{NTFY_TOPIC}", flush=True)
+    except Exception as e:
+        print(f"[ntfy] announce failed: {e}", flush=True)
+    os.makedirs(WORK_DIR, exist_ok=True)
+    with open(os.path.join(WORK_DIR, "tunnel_url.txt"), "w") as f:
+        f.write(url + "\n")
+    info = {
+        "service": "llama.cpp OpenAI-compatible server (MiniCPM-V 4.7)",
+        "model": REPO + " (" + QUANT + ")",
+        "public_base_url": url,
+        "openai_base_url": url + "/v1",
+        "web_ui_url": url + "/",
+        "health": url + "/health",
+        "endpoints_in_session": {"chat": SERVER_BASE + "/v1/chat/completions"},
+        "gpus": results.get("env", {}).get("gpu_list"),
+        "gpu_memory_after_load": results.get("gpu_mem_after_load"),
+        "context": CTX, "kv_cache": "q8_0",
+        "server_cmd": results.get("server_cmd"),
+        "note": ("OpenAI-compatible: use <public_base_url>/v1 as base_url in any "
+                 "OpenAI SDK / Open WebUI / LobeChat. Built-in llama.cpp WebUI at "
+                 "<public_base_url>/."),
+        "updated": UTC(),
+    }
+    with open(os.path.join(WORK_DIR, "server_info.json"), "w") as f:
+        json.dump(info, f, indent=2)
+    print("\n" + "=" * 68)
+    print("### SERVER ONLINE - MiniCPM-V 4.7 on Kaggle dual T4")
+    print(f"###   OpenAI base URL : {url}/v1")
+    print(f"###   Web UI          : {url}/")
+    print(f"###   Health          : {url}/health")
+    print(f"###   url also at     : {WORK_DIR}/tunnel_url.txt  and  ntfy.sh/{NTFY_TOPIC}")
+    print("=" * 68 + "\n", flush=True)
+    results["public_url"] = url
+
 proc = phase("D_server", start_server)
 
 # ---------------------------------------------------------------- self test
@@ -196,8 +292,7 @@ def chat(messages, max_tokens=512, temperature=0.6, timeout=900):
     j = r.json()
     msg = j["choices"][0]["message"]
     ct = j.get("usage", {}).get("completion_tokens", 0)
-    # NOTE: MiniCPM-V 4.7 is a *thinking* model: reasoning comes back in
-    # `reasoning_content`, the spoken answer in `content`.
+    # Thinking model: answer in `content`, reasoning in `reasoning_content`.
     return {"content": msg.get("content", ""),
             "reasoning": msg.get("reasoning_content", ""),
             "completion_tokens": ct, "wall_sec": round(dt, 1),
@@ -215,19 +310,16 @@ def phase_selftest():
         raise RuntimeError("no server running")
     results["gpu_mem_after_load"] = gpu_snapshot()
     print("[nvidia-smi per-GPU]\n" + "\n".join(results["gpu_mem_after_load"]), flush=True)
-
-    print("[warmup] first request pays a one-time CUDA init cost...", flush=True)
+    print("[warmup] first request pays one-time CUDA init...", flush=True)
     t0 = time.time()
     w = chat([{"role": "user", "content": "Say hi."}], max_tokens=8)
     print(f"[warmup] {round(time.time()-t0,1)}s -> {w['content'][:60]!r}", flush=True)
     results["warmup"] = w
-
     r1 = chat([{"role": "user",
                 "content": "Explain mixture-of-experts neural networks in one sentence."}],
               max_tokens=256)
     print("[text test]", json.dumps(r1, indent=1)[:1200], flush=True)
     results["text_test"] = r1
-
     r2 = chat([{"role": "user", "content": [
         {"type": "image_url",
          "image_url": {"url":
@@ -241,74 +333,95 @@ def phase_selftest():
 if proc is not None:
     phase("E_selftest", phase_selftest)
 
-# ------------------------------------------------------------ write status
-def write_status():
-    os.makedirs(WORK_DIR, exist_ok=True)
-    info = {
-        "service": "llama.cpp OpenAI-compatible server",
-        "model": REPO + " (" + QUANT + ")",
-        "base_url_in_session": SERVER_BASE,
-        "endpoints": {
-            "chat": SERVER_BASE + "/v1/chat/completions",
-            "health": SERVER_BASE + "/health",
-            "models": SERVER_BASE + "/v1/models",
-        },
-        "gpus": results.get("env", {}).get("gpu_list"),
-        "gpu_memory_after_load": results.get("gpu_mem_after_load"),
-        "context": CTX,
-        "kv_cache": "q8_0",
-        "server_cmd": results.get("server_cmd"),
-        "updated": UTC(),
-    }
-    with open(os.path.join(WORK_DIR, "server_info.json"), "w") as f:
-        json.dump(info, f, indent=2)
+# ------------------------------------------------- tunnel + control + keepalive
+def session_keepalive():
+    """Fallback loop: keep the process alive until the Kaggle session ends."""
+    print("[keepalive] server alive (session-local on :%d); no tunnel" % PORT, flush=True)
+    while True:
+        time.sleep(300)
+        if proc is not None and proc.poll() is not None:
+            print("[keepalive] server process died - restarting", flush=True)
+            globals()["proc"] = start_server()
+        else:
+            print("[keepalive] beat | " + " | ".join(gpu_snapshot()), flush=True)
 
-write_status()
-
-# ---------------------------------------------------------------- server loop
 if MODE == "server" and proc is not None:
-    print("\n" + "=" * 68, flush=True)
-    print("### SERVER READY - llama.cpp OpenAI API is serving")
-    print(f"###   base_url : {SERVER_BASE}")
-    print("###   chat     : POST /v1/chat/completions")
-    print("###   from another notebook cell / terminal in this session:")
-    print(f'###     curl {SERVER_BASE}/v1/chat/completions -H "Content-Type: application/json" \\\n'
-          '###       -d \'{"model":"mm","messages":[{"role":"user","content":"hello"}],"max_tokens":128}\'')
-    print("###   (Kaggle has no official tunnel: access is session-local unless")
-    print("###    you bring your own connector - see repo README)")
-    print("=" * 68 + "\n", flush=True)
-    restarts, beat = 0, 0
     try:
+        tproc, turl = start_tunnel()
+        if turl:
+            results["tunnel_started"] = UTC()
+            announce(turl)
+        else:
+            print("[!] tunnel did not come up; server stays session-local on :%d" % PORT, flush=True)
+
+        # ---- remote shutdown listener (ntfy control topic) ----
+        STOP_TS = int(time.time())
+        def control_listener():
+            while True:
+                try:
+                    import urllib.request
+                    with urllib.request.urlopen(
+                            f"https://ntfy.sh/{NTFY_CONTROL}/json?poll=1&since={STOP_TS}",
+                            timeout=30) as resp:
+                        for line in resp:
+                            if b"shutdown" in line:
+                                print("\n[!] REMOTE SHUTDOWN received - stopping server + tunnel", flush=True)
+                                for p in (tproc,):
+                                    try:
+                                        p and p.terminate()
+                                    except Exception:
+                                        pass
+                                subprocess.run(["bash", "-lc",
+                                                "pkill -f llama-server; pkill -f cloudflared || true"],
+                                               timeout=30)
+                                os._exit(0)
+                except Exception:
+                    pass
+                time.sleep(5)
+        threading.Thread(target=control_listener, daemon=True).start()
+        print(f"[+] remote shutdown armed: publish 'shutdown' to ntfy.sh/{NTFY_CONTROL}", flush=True)
+
+        # ---- keepalive: restart server/tunnel if either dies ----
+        beat = 0
         while True:
-            time.sleep(300)                       # 5-minute heartbeat
+            time.sleep(300)
             beat += 1
+            import requests
+            srv_ok = False
             try:
-                import requests
-                alive = requests.get(SERVER_BASE + "/health", timeout=5).status_code == 200
+                srv_ok = requests.get(SERVER_BASE + "/health", timeout=5).status_code == 200
             except Exception:
-                alive = False
-            if proc.poll() is not None or not alive:
-                restarts += 1
-                print(f"[keepalive] server not answering (beat {beat}) - restarting...", flush=True)
-                results.setdefault("restarts", 0)
-                results["restarts"] = results.get("restarts", 0) + 1
-                proc = start_server()
+                pass
+            tun_ok = tproc is not None and tproc.poll() is None
+            if proc.poll() is not None or not srv_ok:
+                print(f"[keepalive] server down (beat {beat}) - restarting...", flush=True)
+                globals()["proc"] = start_server()
                 if proc is None:
-                    print("[keepalive] restart failed; will retry next beat", flush=True)
+                    print("[keepalive] server restart failed; retry next beat", flush=True)
                     time.sleep(120)
-            if beat % 6 == 0:                       # every ~30 min
-                snap = gpu_snapshot()
-                print(f"[keepalive] beat {beat} alive | " + " | ".join(snap), flush=True)
-                write_status()
+            if tproc is not None and (tproc.poll() is not None or not tun_ok):
+                print(f"[keepalive] tunnel down (beat {beat}) - restarting + republishing...", flush=True)
+                tproc, turl = start_tunnel()
+                if turl:
+                    announce(turl)
+            if beat % 6 == 0:
+                print(f"[keepalive] beat {beat} | server={'up' if srv_ok else 'down'} "
+                      f"tunnel={'up' if tun_ok else 'down'} | "
+                      + " | ".join(gpu_snapshot()), flush=True)
+    except Exception as e:
+        # A tunnel problem must never take the serving session down.
+        print(f"[tunnel block] unexpected error: {e} - falling back to session-local serving", flush=True)
+        session_keepalive()
     except (KeyboardInterrupt, SystemExit):
-        print("[keepalive] interrupted - shutting server down", flush=True)
-        subprocess.run(["bash", "-lc", "pkill -f llama-server || true"], timeout=30)
+        print("[keepalive] interrupted - shutting down", flush=True)
+        subprocess.run(["bash", "-lc",
+                        "pkill -f llama-server; pkill -f cloudflared || true"], timeout=30)
 
 results["finished"] = UTC()
 with open(os.path.join(WORK_DIR, "results.json"), "w") as f:
     json.dump(results, f, indent=2)
 print("\n### SUMMARY\n" + json.dumps(
     {k: v for k, v in results.items() if k in
-     ("mode", "env", "server_load_sec", "gpu_mem_after_load", "gpu_mem_final",
-      "phases", "text_test", "vision_test")}, indent=2)[:3500], flush=True)
+     ("mode", "env", "public_url", "server_load_sec", "gpu_mem_after_load",
+      "gpu_mem_final", "phases", "text_test", "vision_test")}, indent=2)[:3500], flush=True)
 print("DONE", flush=True)

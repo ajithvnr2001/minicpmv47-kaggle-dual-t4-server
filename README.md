@@ -57,8 +57,8 @@ KAGGLE_API_TOKEN='KGAT_xxxxxxxx...' bash scripts/push_kernel.sh
 ```
 
 That's it. Kaggle runs the kernel immediately: installs llama.cpp, downloads the
-model (~90 s), loads it onto **both** T4s, runs a self-test, and serves at
-`0.0.0.0:8080` inside the session. Watch it:
+model (~90 s), loads it onto **both** T4s, runs a self-test, starts a Cloudflare
+quick tunnel, and **publishes the public URL to ntfy.sh** (see step 2). Watch it:
 
 ```bash
 KAGGLE_API_TOKEN="$KAGGLE_API_TOKEN" \
@@ -66,49 +66,79 @@ KAGGLE_API_TOKEN="$KAGGLE_API_TOKEN" \
 # or open https://www.kaggle.com/code/<your-username>/minicpmv47-server-dual-t4
 ```
 
-The kernel log prints `### SERVER READY ...` when the API is live.
+The kernel log prints `### SERVER ONLINE ###` with the URL when the API is live,
+and the URL lands on `ntfy.sh/ajith-kaggle-minicpmv47-cluster` within seconds.
 
-**2. Use the server (session-local)**
+**2. Get the tunnel URL** (it changes every deployment — by design)
 
-From any cell / terminal **inside that Kaggle session**:
+The kernel publishes its public HTTPS endpoint to an **ntfy.sh** topic the moment
+the tunnel is up:
 
 ```bash
-# health
-curl -s http://127.0.0.1:8080/health
+# latest URL (this is the discovery mechanism — poll it any time)
+curl -s "https://ntfy.sh/ajith-kaggle-minicpmv47-cluster/json?poll=1&since=all" | tail -1
 
-# chat
-curl -s http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"mm","messages":[{"role":"user","content":"Explain MoE in one sentence."}],"max_tokens":256}'
-
-# vision
-curl -s http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"mm","messages":[{"role":"user","content":[
-        {"type":"image_url","image_url":{"url":"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}},
-        {"type":"text","text":"What animal is on the candy?"}]}],"max_tokens":256}'
+# subscribe live (browser/app):  https://ntfy.sh/ajith-kaggle-minicpmv47-cluster
+# control topic (remote shutdown): https://ntfy.sh/ajith-kaggle-minicpmv47-control
 ```
 
-Python:
+The URL is also printed in the kernel log (`### SERVER ONLINE ###`) and written to
+`/kaggle/working/tunnel_url.txt` + `server_info.json` (fetchable with
+`kaggle kernels output <ref> -p out/` once the run ends).
+It looks like: `https://<random-words>.trycloudflare.com`.
+
+**3. Use it — UI or API**
+
+- **Web UI (browser):** open the tunnel URL directly — llama.cpp's built-in
+  WebUI is served at `/`.
+- **API (OpenAI-compatible):** `base_url = <tunnel-url>/v1`
 
 ```python
-import requests
-BASE = "http://127.0.0.1:8080"
-r = requests.post(BASE + "/v1/chat/completions", json={
-    "model": "mm",
-    "messages": [{"role": "user",
-                  "content": [{"type": "image_url", "image_url": {"url": "https://.../candy.JPG"}},
-                              {"type": "text", "text": "Describe this image."}]}],
-    "max_tokens": 256}).json()
-print(r["choices"][0]["message"]["content"])
+# Official OpenAI Python SDK (pip install openai)
+from openai import OpenAI
+client = OpenAI(base_url="https://<random-words>.trycloudflare.com/v1", api_key="none")
+
+# text
+r = client.chat.completions.create(
+    model="mm",
+    messages=[{"role": "user", "content": "Explain mixture-of-experts in one sentence."}],
+    max_tokens=512,
+)
+print(r.choices[0].message.content)
+# NOTE: MiniCPM-V 4.7 is a *thinking* model - short answers may come back in
+# message.reasoning_content with content empty; give it >=384-512 tokens.
+
+# vision
+r = client.chat.completions.create(
+    model="mm",
+    messages=[{"role": "user", "content": [
+        {"type": "image_url",
+         "image_url": {"url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}},
+        {"type": "text", "text": "What animal is on the candy?"}]}],
+    max_tokens=512,
+)
 ```
 
-> ⚠️ **Access is session-local.** Kaggle provides no official tunnel/ingress;
-> using cloudflared/ngrok is against Kaggle's terms and is not supported. To call
-> the server from outside, either use the Kaggle notebook UI interactively, or run
-> the same script on any dual-GPU machine you control (the script is not
-> Kaggle-specific — it just needs `nvidia-smi`, `curl`, `python3` and two GPUs;
-> it writes `server_info.json` next to it).
+```bash
+curl https://<random-words>.trycloudflare.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mm","messages":[{"role":"user","content":"hello"}],"max_tokens":512}'
+```
+
+Any OpenAI-compatible client works: Open WebUI, LobeChat, LangChain, LiteLLM,
+Cursor — point them at `<tunnel-url>/v1`.
+
+**4. Stop it (save GPU quota)**
+
+```bash
+# publish the control word; the kernel stops the server + tunnel and exits
+curl -d "shutdown" https://ntfy.sh/ajith-kaggle-minicpmv47-control
+```
+
+> ⚠️ **Kaggle terms:** Kaggle does not officially support tunnels/ingress
+> (cloudflared, ngrok, etc.). You asked for this explicitly and understand the
+> tradeoff; usage is at your own discretion and risk. Sessions are also capped
+> at 12 h and ~60 min idle; the kernel's heartbeat loop keeps it *active*.
 
 ---
 
@@ -129,9 +159,12 @@ Environment knobs (set before pushing, they're read at run time):
 
 | Var | Default | Meaning |
 |---|---|---|
-| `MODE` | `server` | `server` = keep serving; `test` = benchmark once and exit |
+| `MODE` | `server` | `server` = serve + tunnel + keepalive; `test` = benchmark once and exit |
 | `CTX` | `32768` | context length (tokens). 32K KV ≈ 1.3 GB; up to 256K is model-native |
-| `PORT` | `8080` | server port |
+| `PORT` | `8080` | server port (the tunnel targets it) |
+| `NTFY_TOPIC` | `ajith-kaggle-minicpmv47-cluster` | topic the public URL is published to |
+| `NTFY_CONTROL` | `ajith-kaggle-minicpmv47-control` | topic that accepts the `shutdown` control word |
+| `LLAMA_BUILD` | `b11583` | llama.cpp build to download |
 
 The core launch command (proven to work; auto-derived from GPU count):
 
@@ -159,6 +192,7 @@ Source: real run logs (`slot print_timing` + API wall-clock). Full payload in
 | Decode, 512 tokens (server timing) | **57.5 tokens/s** |
 | Text chat via API (end-to-end) | **51.4–54.7 tokens/s** |
 | Vision chat via API (image prefill + decode) | **31.0 tokens/s** |
+| **Through the public Cloudflare tunnel (verified from outside Kaggle)** | **~47 tokens/s** steady; TTFT ≈ 0.5–1 s |
 | GPU memory after load | **GPU0 11.42 GB · GPU1 9.83 GB** |
 | Model load | ~85 s |
 | Model download | ~90 s |
